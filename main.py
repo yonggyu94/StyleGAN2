@@ -5,6 +5,7 @@ from torch.backends import cudnn
 
 channel_list = [512, 512, 512, 512, 256, 128, 64, 32]
 
+
 def main(config):
     # find optimal set of algorithm on our configuration setting
     cudnn.benchmark = True
@@ -55,7 +56,7 @@ if __name__ == '__main__':
 
     # Config - Path
     parser.add_argument('--data_root', type=str, default="/home/nas1_userC/yonggyu/dataset/FFHQ")
-    parser.add_argument('--exp', type=str, default='PGGAN_512')
+    parser.add_argument('--exp', type=str, default='StyleGAN2_512')
     parser.add_argument('--log_dir', type=str, default='log')
     parser.add_argument('--model_dir', type=str, default='model')
     parser.add_argument('--sample_dir', type=str, default='sample')
