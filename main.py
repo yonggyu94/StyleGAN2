@@ -54,6 +54,11 @@ if __name__ == '__main__':
     parser.add_argument('--n_critic', type=int, default=1)
     parser.add_argument('--max_iter', type=int, default=50000)
 
+    parser.add_argument('--r1_iter', type=int, default=16)
+    parser.add_argument('--r1_lambda', type=float, default=1.0)
+    parser.add_argument('--ppl_iter', type=int, default=16)
+    parser.add_argument('--ppl_lambda', type=float, default=1.0)
+
     # Config - Path
     parser.add_argument('--data_root', type=str, default="/home/nas1_userC/yonggyu/dataset/FFHQ")
     parser.add_argument('--exp', type=str, default='StyleGAN2_512')

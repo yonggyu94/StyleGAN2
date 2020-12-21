@@ -1,6 +1,7 @@
 import os
 
 import torch
+import torch.nn.functional as F
 from torchvision.utils import save_image, make_grid
 import torch.optim.lr_scheduler as lr_scheduler
 
@@ -13,6 +14,7 @@ from utils import cycle
 from torch.nn import DataParallel
 
 from torch.utils.tensorboard import SummaryWriter
+import math
 
 dev = 'cpu'
 if torch.cuda.is_available():
@@ -36,6 +38,11 @@ class Solver():
         self.n_critic = config.n_critic
         self.lambda_gp = config.lambda_gp
         self.max_iter = config.max_iter
+
+        self.r1_iter = config.r1_iter
+        self.r1_lambda = config.r1_lambda
+        self.ppl_iter = config.ppl_iter
+        self.ppl_lambda = config.ppl_lambda
 
         # Config - Test
         self.fixed_z = torch.randn(512, config.z_dim).to(dev)
@@ -96,8 +103,8 @@ class Solver():
         self.D.load_state_dict(ckpt["D"])
         self.M.load_state_dict(ckpt["M"])
 
-    def save_model(self, iters, step):
-        file_name = 'ckpt_%d_%d.pkl' % ((2*(2**(step+1)), iters))
+    def save_model(self, iters):
+        file_name = 'ckpt_%d.pkl' % iters
         ckpt_path = os.path.join(self.model_root, file_name)
         ckpt = {
             'M': self.M.state_dict(),
@@ -107,13 +114,13 @@ class Solver():
         }
         torch.save(ckpt, ckpt_path)
 
-    def save_img(self, iters, fixed_w, step):
-        img_path = os.path.join(self.sample_root, "%d_%d.png" % (2*(2**(step+1)), iters))
+    def save_img(self, iters, fixed_w):
+        img_path = os.path.join(self.sample_root, "%d.png" % iters)
         with torch.no_grad():
             fixed_w = fixed_w[:self.batch_size*2]
             w1, w2 = torch.split(fixed_w, self.batch_size, dim=0)
             const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
-            generated_imgs = self.G_ema(const, w1, w2, step, 1)
+            generated_imgs = self.G_ema(const, w1, w2)
             save_image(make_grid(generated_imgs.cpu()/2+1/2, nrow=4, padding=2), img_path)
 
     def reset_grad(self):
@@ -144,122 +151,112 @@ class Solver():
                 g_param = G_param_dict[name]
                 g_ema_param.copy_(beta * g_ema_param + (1. - beta) * g_param)
 
-    def gradient_penalty(self, y, x):
-        """Compute gradient penalty: (L2_norm(dy/dx) - 1)**2."""
-        weight = torch.ones(y.size()).to(dev)
-        dydx = torch.autograd.grad(outputs=y,
-                                   inputs=x,
-                                   grad_outputs=weight,
-                                   retain_graph=True,
-                                   create_graph=True,
-                                   only_inputs=True)[0]
+    def r1_regularization(self, real_pred, real_img):
+        grad_real = torch.autograd.grad(outputs=real_pred.sum(), inputs=real_img,
+                                        create_graph=True)[0]
+        grad_penalty = grad_real.pow(2).view(grad_real.size(0), -1).sum(1).mean()
+        return grad_penalty
 
-        dydx = dydx.view(dydx.size(0), -1)
-        dydx_l2norm = torch.sqrt(torch.sum(dydx**2, dim=1))
-        return torch.mean((dydx_l2norm-1)**2)
+    def path_length_regularization(self, fake_img, latents, mean_path_length, decay=0.01):
+        noise = torch.randn_like(fake_img) / math.sqrt(
+            fake_img.shape[2] * fake_img.shape[3]
+        )
+        grad = torch.autograd.grad(outputs=(fake_img * noise).sum(), inputs=latents,
+                                   create_graph=True)[0]
+        path_lengths = torch.sqrt(grad.pow(2).sum(2).mean(1))
+        path_mean = mean_path_length + decay * (path_lengths.mean() - mean_path_length)
+        path_penalty = (path_lengths - path_mean).pow(2).mean()
+        return path_penalty, path_mean.detach(), path_lengths
 
     def train(self):
         # build model
         self.build_model()
+        loader = data_loader(self.data_root, self.batch_size, img_size=512)
+        loader = iter(cycle(loader))
 
-        for step in range(len(self.channel_list)):
-            if step > 4:
-                self.batch_size = self.batch_size // 2
-            loader = data_loader(self.data_root, self.batch_size, img_size=2 * (2 ** (step + 1)))
-            loader = iter(cycle(loader))
+        for iters in range(self.max_iter + 1):
+            real_img = next(loader)
+            real_img = real_img.to(dev)
+            # ===============================================================#
+            #                    1. Train the discriminator                  #
+            # ===============================================================#
+            self.set_phase(mode="train")
+            self.reset_grad()
 
-            if step == 0 or step == 1 or step == 2:
-                self.max_iter = 20000
-            elif step == 3 or step == 4 or step == 5:
-                self.max_iter = 50000
-            else:
-                self.max_iter = 100000
+            # Compute loss with real images.
+            d_real_out = self.D(real_img)
+            d_loss_real = F.softplus(-d_real_out)
 
-            alpha = 0.0
+            # Compute loss with face images.
+            const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
+            z = torch.randn(2 * self.batch_size, self.z_dim).to(dev)
+            w = self.M(z)
+            w1, w2 = torch.split(w, self.batch_size, dim=0)
+            fake_img = self.G(const, w1, w2)
+            d_fake_out = self.D(fake_img.detach())
+            d_loss_fake = F.softplus(d_fake_out)
 
-            for iters in range(self.max_iter+1):
-                real_img = next(loader)
-                real_img = real_img.to(dev)
-                # ===============================================================#
-                #                    1. Train the discriminator                  #
-                # ===============================================================#
-                self.set_phase(mode="train")
+            d_loss = d_loss_real.mean() + d_loss_fake.mean()
+
+            if iters % self.r1_iter == 0:
+                real_img.requires_grad = True
+                d_real_out = self.D(real_img)
+                r1_loss = self.r1_regularization(d_real_out, real_img)
+                r1_loss = self.r1_lambda / 2 * r1_loss * self.r1_iter
+                d_loss = d_loss + r1_loss
+
+            d_loss.backward()
+            self.d_optimizer.step()
+
+            # ===============================================================#
+            #                      2. Train the Generator                    #
+            # ===============================================================#
+
+            if (iters + 1) % self.n_critic == 0:
                 self.reset_grad()
 
-                # Compute loss with real images.
-                d_real_out = self.D(real_img, step, alpha)
-                d_loss_real = - d_real_out.mean()
-
-                # Compute loss with face images.
+                # Compute loss with fake images.
                 const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
                 z = torch.randn(2 * self.batch_size, self.z_dim).to(dev)
                 w = self.M(z)
                 w1, w2 = torch.split(w, self.batch_size, dim=0)
-                fake_img = self.G(const, w1, w2, step, alpha)
-                d_fake_out = self.D(fake_img.detach(), step, alpha)
-                d_loss_fake = d_fake_out.mean()
-
-                # Compute loss for gradient penalty.
-                beta = torch.randn(self.batch_size, 1, 1, 1).to(dev)
-                x_hat = (beta * real_img.data + (1 - beta) * fake_img.data).requires_grad_(True)
-                d_x_hat_out = self.D(x_hat, step, alpha)
-                d_loss_gp = self.gradient_penalty(d_x_hat_out, x_hat)
+                fake_img = self.G(const, w1, w2)
+                d_fake_out = self.D(fake_img)
+                g_loss = F.softplus(-d_fake_out).mean()
 
                 # Backward and optimize.
-                d_loss = d_loss_real + d_loss_fake + self.lambda_gp * d_loss_gp
-                d_loss.backward()
-                self.d_optimizer.step()
+                g_loss.backward()
+                self.g_optimizer.step()
 
-                # ===============================================================#
-                #                      2. Train the Generator                    #
-                # ===============================================================#
+            # ===============================================================#
+            #                   3. Save parameters and images                #
+            # ===============================================================#
+            # self.lr_update()
+            torch.cuda.synchronize()
+            self.set_phase(mode="test")
+            self.exponential_moving_average()
 
-                if (iters + 1) % self.n_critic == 0:
-                    self.reset_grad()
-
-                    # Compute loss with fake images.
-                    const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
-                    z = torch.randn(2 * self.batch_size, self.z_dim).to(dev)
-                    w = self.M(z)
-                    w1, w2 = torch.split(w, self.batch_size, dim=0)
-                    fake_img = self.G(const, w1, w2, step, alpha)
-                    d_fake_out = self.D(fake_img, step, alpha)
-                    g_loss = - d_fake_out.mean()
-
-                    # Backward and optimize.
-                    g_loss.backward()
-                    self.g_optimizer.step()
-
-                # ===============================================================#
-                #                   3. Save parameters and images                #
-                # ===============================================================#
-                # self.lr_update()
-                torch.cuda.synchronize()
-                alpha += 1 / (self.max_iter // 2)
-                self.set_phase(mode="test")
-                self.exponential_moving_average()
-
-                # Print total loss
-                if iters % self.print_loss_iter == 0:
-                    print("Step : [%d/%d], Iter : [%d/%d], D_loss : [%.3f, %.3f, %.3f., %.3f], G_loss : %.3f" % (
-                        step, len(self.channel_list)-1, iters, self.max_iter, d_loss.item(), d_loss_real.item(),
-                        d_loss_fake.item(), d_loss_gp.item(), g_loss.item()
+            # Print total loss
+            if iters % self.print_loss_iter == 0:
+                print(
+                    "Iter : [%d/%d], D_loss : [%.3f, %.3f, %.3f.], G_loss : %.3f" % (
+                        iters, self.max_iter, d_loss.item(),
+                        d_loss_real.item(),
+                        d_loss_fake.item(), g_loss.item()
                     ))
 
-                # Save generated images.
-                if iters % self.save_image_iter == 0:
-                    fixed_w = self.M(self.fixed_z)
-                    self.save_img(iters, fixed_w, step)
+            # Save generated images.
+            if iters % self.save_image_iter == 0:
+                fixed_w = self.M(self.fixed_z)
+                self.save_img(iters, fixed_w)
 
-                # Save the G and D parameters.
-                if iters % self.save_parameter_iter == 0:
-                    self.save_model(iters, step)
+            # Save the G and D parameters.
+            if iters % self.save_parameter_iter == 0:
+                self.save_model(iters)
 
-                # Save the logs on the tensorboard.
-                if iters % self.save_log_iter == 0:
-                    self.writer.add_scalar('g_loss/g_loss', g_loss.item(), iters)
-                    self.writer.add_scalar('d_loss/d_loss_total', d_loss.item(), iters)
-                    self.writer.add_scalar('d_loss/d_loss_real', d_loss_real.item(), iters)
-                    self.writer.add_scalar('d_loss/d_loss_fake', d_loss_fake.item(), iters)
-                    self.writer.add_scalar('d_loss/d_loss_gp', d_loss_gp.item(), iters)
-
+            # Save the logs on the tensorboard.
+            if iters % self.save_log_iter == 0:
+                self.writer.add_scalar('g_loss/g_loss', g_loss.item(), iters)
+                self.writer.add_scalar('d_loss/d_loss_total', d_loss.item(), iters)
+                self.writer.add_scalar('d_loss/d_loss_real', d_loss_real.item(), iters)
+                self.writer.add_scalar('d_loss/d_loss_fake', d_loss_fake.item(), iters)
