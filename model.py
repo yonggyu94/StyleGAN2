@@ -23,20 +23,12 @@ class WrongNonLinearException(Exception):
         return 'You should choose \'relu\', \'leaky_relu\''
 
 
-"""
-20.12.19 TODO List
-# 1. Weight demodulation
-# 2. G output skips
-3. D residual
-"""
-
-
 class WeightDemodulation(nn.Module):
     def __init__(self, in_ch, out_ch, k_size, w_dim=512):
         super(WeightDemodulation, self).__init__()
         self.fan_in = in_ch * k_size * k_size
 
-        weight = torch.randn(out_ch, in_ch, k_size, k_size)
+        weight = torch.randn(1, out_ch, in_ch, k_size, k_size)
         self.weight = nn.Parameter(weight)
         self.linear = EqualizedLinear(w_dim, in_ch)
 
@@ -44,10 +36,12 @@ class WeightDemodulation(nn.Module):
         weight = self.weight * math.sqrt(2 / self.fan_in)
         w_out = self.linear(w)
 
-        mod_conv = w_out.unsqueeze(2).unsqueeze(3) * weight
-        sqare_value = (mod_conv ** 2).sum(dim=1, keepdim=True).sum(dim=1, keepdim=True).sum(
-            dim=1, keepdim=True)
+        mod_conv = w_out.unsqueeze(2).unsqueeze(3).unsqueeze(1) * weight
+        sqare_value = (mod_conv ** 2).sum(dim=2, keepdim=True).sum(dim=3, keepdim=True).sum(
+            dim=4, keepdim=True)
+
         demod_conv = mod_conv / torch.sqrt(sqare_value + 1e-8)
+
         return demod_conv
 
 
@@ -331,8 +325,8 @@ class Generator(nn.Module):
         self.to_rgb = nn.ModuleList(to_rgb_layers)
 
     def forward(self, x, w1, w2):
-        w1 = w1.unsqueeze(1).repeat(1, 2*(step+1), 1)
-        w2 = w2.unsqueeze(1).repeat(1, 2*(step+1), 1)
+        w1 = w1.unsqueeze(1).repeat(1, 15, 1)
+        w2 = w2.unsqueeze(1).repeat(1, 15, 1)
 
         layer_idx = torch.from_numpy(np.arange(2*self.n_layer-1)[np.newaxis, :, np.newaxis]).to(dev)
         if random.random() < self.style_mixing_prob:
@@ -351,7 +345,7 @@ class Generator(nn.Module):
                 out = block(out, dlatents_in[:, 2*i-1], dlatents_in[:, 2*i])
                 rgb_img = to_rgb(out)
                 rgb_img = rgb_img + upsampled_rgb_img
-        return rgb_img
+        return rgb_img, dlatents_in
 
 
 class Discriminator(nn.Module):
@@ -396,7 +390,6 @@ class Discriminator(nn.Module):
 
 if __name__ == "__main__":
     z = torch.rand(8, 512).to(dev)
-    img = torch.rand(4, 3, 512, 512).to(dev)
     const = torch.ones(4, 512, 4, 4).to(dev)
 
     m = MappingNetwork(z_dim=512).to(dev)
@@ -407,10 +400,9 @@ if __name__ == "__main__":
     w = m(z)
     w1, w2 = torch.split(w, 4, dim=0)
     print("Generator")
-    for step in range(8):
-        out = g(const, w1, w2, step=step, alpha=alpha)
-        print(out.shape)
+    out = g(const, w1, w2)
+    print(out.shape)
 
     print("Discriminator")
-    out = d(img, step=7, alpha=alpha)
+    out = d(out)
     print(out.shape)

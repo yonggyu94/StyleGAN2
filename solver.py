@@ -120,7 +120,7 @@ class Solver():
             fixed_w = fixed_w[:self.batch_size*2]
             w1, w2 = torch.split(fixed_w, self.batch_size, dim=0)
             const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
-            generated_imgs = self.G_ema(const, w1, w2)
+            generated_imgs, _ = self.G_ema(const, w1, w2)
             save_image(make_grid(generated_imgs.cpu()/2+1/2, nrow=4, padding=2), img_path)
 
     def reset_grad(self):
@@ -158,9 +158,7 @@ class Solver():
         return grad_penalty
 
     def path_length_regularization(self, fake_img, latents, mean_path_length, decay=0.01):
-        noise = torch.randn_like(fake_img) / math.sqrt(
-            fake_img.shape[2] * fake_img.shape[3]
-        )
+        noise = torch.randn_like(fake_img) / math.sqrt(fake_img.shape[2] * fake_img.shape[3])
         grad = torch.autograd.grad(outputs=(fake_img * noise).sum(), inputs=latents,
                                    create_graph=True)[0]
         path_lengths = torch.sqrt(grad.pow(2).sum(2).mean(1))
@@ -173,6 +171,8 @@ class Solver():
         self.build_model()
         loader = data_loader(self.data_root, self.batch_size, img_size=512)
         loader = iter(cycle(loader))
+        mean_path_length = torch.tensor(0.0).to(dev)
+        average_path_length = torch.tensor(0.0).to(dev)
 
         for iters in range(self.max_iter + 1):
             real_img = next(loader)
@@ -192,7 +192,7 @@ class Solver():
             z = torch.randn(2 * self.batch_size, self.z_dim).to(dev)
             w = self.M(z)
             w1, w2 = torch.split(w, self.batch_size, dim=0)
-            fake_img = self.G(const, w1, w2)
+            fake_img, _ = self.G(const, w1, w2)
             d_fake_out = self.D(fake_img.detach())
             d_loss_fake = F.softplus(d_fake_out)
 
@@ -220,9 +220,18 @@ class Solver():
                 z = torch.randn(2 * self.batch_size, self.z_dim).to(dev)
                 w = self.M(z)
                 w1, w2 = torch.split(w, self.batch_size, dim=0)
-                fake_img = self.G(const, w1, w2)
+                fake_img, dlatents_in = self.G(const, w1, w2)
                 d_fake_out = self.D(fake_img)
                 g_loss = F.softplus(-d_fake_out).mean()
+
+                if iters % self.ppl_lambda == 0:
+                    path_loss, mean_path_length, path_length = self.path_length_regularization(
+                    fake_img, dlatents_in, mean_path_length)
+                    path_loss = path_loss*self.ppl_iter*self.ppl_lambda
+                    g_loss = g_loss + path_loss
+
+                    mean_path_length = mean_path_length.mean()
+                    average_path_length += mean_path_length.mean()
 
                 # Backward and optimize.
                 g_loss.backward()
@@ -238,12 +247,13 @@ class Solver():
 
             # Print total loss
             if iters % self.print_loss_iter == 0:
-                print(
-                    "Iter : [%d/%d], D_loss : [%.3f, %.3f, %.3f.], G_loss : %.3f" % (
-                        iters, self.max_iter, d_loss.item(),
-                        d_loss_real.item(),
-                        d_loss_fake.item(), g_loss.item()
-                    ))
+                print("Iter : [%d/%d], D_loss : [%.3f, %.3f, %.3f.], G_loss : %.3f, R1_reg : %.3f, "
+                      "PPL_reg : %.3f, Path_length : %.3f" % (iters, self.max_iter, d_loss.item(),
+                                                              d_loss_real.item(),
+                                                              d_loss_fake.item(),
+                                                              g_loss.item(), r1_loss.item(),
+                                                              path_loss.item(),
+                                                              mean_path_length.item()))
 
             # Save generated images.
             if iters % self.save_image_iter == 0:
@@ -260,3 +270,9 @@ class Solver():
                 self.writer.add_scalar('d_loss/d_loss_total', d_loss.item(), iters)
                 self.writer.add_scalar('d_loss/d_loss_real', d_loss_real.item(), iters)
                 self.writer.add_scalar('d_loss/d_loss_fake', d_loss_fake.item(), iters)
+                self.writer.add_scalar('reg/r1_regularization', r1_loss.item(), iters)
+                self.writer.add_scalar('reg/ppl_regularization', path_loss.item(), iters)
+
+                self.writer.add_scalar('length/path_length', mean_path_length.item(), iters)
+                self.writer.add_scalar('length/avg_path_length', average_path_length.item() /
+                                       (iters // self.ppl_iter), iters)
