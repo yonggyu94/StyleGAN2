@@ -1,7 +1,7 @@
-import os
 import argparse
 from solver import Solver
 from torch.backends import cudnn
+from utils import make_folder
 
 channel_list = [512, 512, 512, 512, 256, 128, 64, 32]
 
@@ -9,28 +9,11 @@ channel_list = [512, 512, 512, 512, 256, 128, 64, 32]
 def main(config):
     # find optimal set of algorithm on our configuration setting
     cudnn.benchmark = True
-    exp_root = config.exp
-
-    log_root = os.path.join(exp_root, config.log_dir)
-    model_root = os.path.join(exp_root, config.model_dir)
-    sample_root = os.path.join(exp_root, config.sample_dir)
-    result_root = os.path.join(exp_root, config.result_dir)
-
+    log_root, model_root, sample_root = make_folder(config.exp, config.log_dir, config.model_dir,
+                                                    config.sample_dir)
     config.log_root = log_root
     config.model_root = model_root
     config.sample_root = sample_root
-    config.result_root = result_root
-
-    if not os.path.isdir(exp_root):
-        os.makedirs(exp_root, exist_ok=True)
-    if not os.path.isdir(log_root):
-        os.makedirs(log_root, exist_ok=True)
-    if not os.path.isdir(model_root):
-        os.makedirs(model_root, exist_ok=True)
-    if not os.path.isdir(sample_root):
-        os.makedirs(sample_root, exist_ok=True)
-    if not os.path.isdir(result_root):
-        os.makedirs(result_root, exist_ok=True)
 
     solver = Solver(config, channel_list)
     solver.train()
