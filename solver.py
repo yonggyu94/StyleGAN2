@@ -10,11 +10,12 @@ from model import Discriminator
 from model import MappingNetwork
 
 from dataloader import data_loader
-from utils import cycle
+from utils import cycle, make_latents
 from torch.nn import DataParallel
 
 from torch.utils.tensorboard import SummaryWriter
 import math
+from tqdm import tqdm
 
 dev = 'cpu'
 if torch.cuda.is_available():
@@ -52,7 +53,6 @@ class Solver():
         self.log_root = config.log_root
         self.model_root = config.model_root
         self.sample_root = config.sample_root
-        self.result_root = config.result_root
 
         # Config - Miscellanceous
         self.print_loss_iter = config.print_loss_iter
@@ -118,9 +118,8 @@ class Solver():
         img_path = os.path.join(self.sample_root, "%d.png" % iters)
         with torch.no_grad():
             fixed_w = fixed_w[:self.batch_size*2]
-            w1, w2 = torch.split(fixed_w, self.batch_size, dim=0)
-            const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
-            generated_imgs, _ = self.G_ema(const, w1, w2)
+            dlatents_in = make_latents(fixed_w, self.batch_size, len(self.channel_list))
+            generated_imgs, _ = self.G_ema(dlatents_in)
             save_image(make_grid(generated_imgs.cpu()/2+1/2, nrow=4, padding=2), img_path)
 
     def reset_grad(self):
@@ -174,7 +173,7 @@ class Solver():
         mean_path_length = torch.tensor(0.0).to(dev)
         average_path_length = torch.tensor(0.0).to(dev)
 
-        for iters in range(self.max_iter + 1):
+        for iters in tqdm(range(self.max_iter + 1)):
             real_img = next(loader)
             real_img = real_img.to(dev)
             # ===============================================================#
@@ -185,18 +184,17 @@ class Solver():
 
             # Compute loss with real images.
             d_real_out = self.D(real_img)
-            d_loss_real = F.softplus(-d_real_out)
+            d_loss_real = F.softplus(-d_real_out).mean()
 
             # Compute loss with face images.
-            const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
             z = torch.randn(2 * self.batch_size, self.z_dim).to(dev)
             w = self.M(z)
-            w1, w2 = torch.split(w, self.batch_size, dim=0)
-            fake_img, _ = self.G(const, w1, w2)
+            dlatents_in = make_latents(w, self.batch_size, len(self.channel_list))
+            fake_img, _ = self.G(dlatents_in)
             d_fake_out = self.D(fake_img.detach())
-            d_loss_fake = F.softplus(d_fake_out)
+            d_loss_fake = F.softplus(d_fake_out).mean()
 
-            d_loss = d_loss_real.mean() + d_loss_fake.mean()
+            d_loss = d_loss_real + d_loss_fake
 
             if iters % self.r1_iter == 0:
                 real_img.requires_grad = True
@@ -207,7 +205,6 @@ class Solver():
 
             d_loss.backward()
             self.d_optimizer.step()
-
             # ===============================================================#
             #                      2. Train the Generator                    #
             # ===============================================================#
@@ -216,20 +213,18 @@ class Solver():
                 self.reset_grad()
 
                 # Compute loss with fake images.
-                const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
                 z = torch.randn(2 * self.batch_size, self.z_dim).to(dev)
                 w = self.M(z)
-                w1, w2 = torch.split(w, self.batch_size, dim=0)
-                fake_img, dlatents_in = self.G(const, w1, w2)
+                dlatents_in = make_latents(w, self.batch_size, len(self.channel_list))
+                fake_img, _ = self.G(dlatents_in)
                 d_fake_out = self.D(fake_img)
                 g_loss = F.softplus(-d_fake_out).mean()
 
-                if iters % self.ppl_lambda == 0:
+                if iters % self.ppl_iter == 0:
                     path_loss, mean_path_length, path_length = self.path_length_regularization(
                     fake_img, dlatents_in, mean_path_length)
                     path_loss = path_loss*self.ppl_iter*self.ppl_lambda
                     g_loss = g_loss + path_loss
-
                     mean_path_length = mean_path_length.mean()
                     average_path_length += mean_path_length.mean()
 
@@ -275,4 +270,4 @@ class Solver():
 
                 self.writer.add_scalar('length/path_length', mean_path_length.item(), iters)
                 self.writer.add_scalar('length/avg_path_length', average_path_length.item() /
-                                       (iters // self.ppl_iter), iters)
+                                       (iters // self.ppl_iter + 1), iters)

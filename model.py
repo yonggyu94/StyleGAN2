@@ -12,7 +12,7 @@ if torch.cuda.is_available():
 
 
 class ModulatedConv(nn.Module):
-    def __init__(self, in_ch, out_ch, k_size, w_dim=512, upsample=True, modulate=True,
+    def __init__(self, in_ch, out_ch, k_size, w_dim=512, pad=1, upsample=True, modulate=True,
                  demodulate=True):
         super(ModulatedConv, self).__init__()
         self.fan_in = in_ch * k_size * k_size
@@ -28,13 +28,13 @@ class ModulatedConv(nn.Module):
         self.upsample = upsample
         self.modulate = modulate
         self.demodulate = demodulate
+        self.pad = pad
 
     def forward(self, x, w):
         weight = self.weight * math.sqrt(2 / self.fan_in)
         w_out = self.linear(w)
-
         if self.modulate:
-            weight = w_out.unsqueeze(2).unsqueeze(3).unsqueeze(4) * weight  # [B, out, in, K, K]
+            weight = w_out.unsqueeze(1).unsqueeze(3).unsqueeze(4) * weight  # [B, out, in, K, K]
 
         if self.demodulate:
             sqare_value = (weight ** 2).sum(dim=[2, 3, 4], keepdim=True)
@@ -45,10 +45,10 @@ class ModulatedConv(nn.Module):
         if self.upsample:
             weight = weight.transpose(1, 2).reshape(batch*in_ch, self.out_ch, self.k_size,
                                                             self.k_size)
-            out = F.conv_transpose2d(x, weight, stride=2, padding=0)
+            out = F.conv_transpose2d(x, weight, stride=2, padding=0, groups=batch)
         else:
             weight = weight.reshape(batch*self.out_ch, in_ch, self.k_size, self.k_size)
-            out = F.conv2d(x, weight, stride=1, padding=1)
+            out = F.conv2d(x, weight, stride=1, padding=self.pad, groups=batch)
 
         _, _, h, w = out.shape
         out = out.view(batch, self.out_ch, h, w)
@@ -191,7 +191,7 @@ class NoiseInjection(nn.Module):
 
 
 class Blur(nn.Module):
-    def __init__(self, ch, weight=[1, 2, 1], stride=1, normalized=True):
+    def __init__(self, ch, weight=[1, 3, 3, 1], stride=1, normalized=True):
         super(Blur, self).__init__()
         weight = torch.tensor(weight, dtype=torch.float32)
         weight = weight.view(weight.size(0), 1) * weight.view(1, weight.size(0))
@@ -217,9 +217,8 @@ class DownBlock(nn.Module):
         self.conv1 = EqualizedConv2d(in_ch, in_ch, k_size=ksize_1, stride=1, padding=pad_1)
         self.lrelu = nn.LeakyReLU(negative_slope=n_slope)
 
-        self.blur = Blur(in_ch)
-
         self.conv2 = EqualizedConv2d(in_ch, out_ch, k_size=ksize_2, stride=2, padding=pad_2)
+        self.blur = Blur(out_ch, weight=[1, 2, 1])
         self.ksize_2 = ksize_2
 
     def forward(self, x):
@@ -265,26 +264,27 @@ class Generator(nn.Module):
             if i == 0:
                 progress_layers.append(SynthesisConstBlock(channel_list[i], channel_list[i]))
             else:
-                if channel_list[i] < 512:
-                    progress_layers.append(SynthesisBlock(channel_list[i - 1], channel_list[i]))
-                else:
-                    progress_layers.append(SynthesisBlock(channel_list[i - 1], channel_list[i]))
-            to_rgb_layers.append(ModulatedConv(channel_list[i], 3, k_size=1))
+                progress_layers.append(SynthesisBlock(channel_list[i - 1], channel_list[i]))
+            to_rgb_layers.append(ModulatedConv(channel_list[i], 3, k_size=1, pad=0, upsample=False))
 
         self.progress = nn.ModuleList(progress_layers)
         self.to_rgb = nn.ModuleList(to_rgb_layers)
 
-    def forward(self, x, w1, w2):
-        w1 = w1.unsqueeze(1).repeat(1, 15, 1)
-        w2 = w2.unsqueeze(1).repeat(1, 15, 1)
+    def forward(self, dlatents_in):
 
-        layer_idx = torch.from_numpy(np.arange(2*self.n_layer-1)[np.newaxis, :, np.newaxis]).to(dev)
-        if random.random() < self.style_mixing_prob:
-            mixing_cutoff = random.randint(1, 2*self.n_layer-1)
-        else:
-            mixing_cutoff = 2*self.n_layer-1
-
-        dlatents_in = torch.where(layer_idx < mixing_cutoff, w1, w2)
+        x = torch.ones(dlatents_in.size(0), 512, 4, 4).to(dev)
+        # w1, w2 = torch.split(w, x.size(0), dim=0)
+        #
+        # w1 = w1.unsqueeze(1).repeat(1, 15, 1)
+        # w2 = w2.unsqueeze(1).repeat(1, 15, 1)
+        #
+        # layer_idx = torch.from_numpy(np.arange(2*self.n_layer-1)[np.newaxis, :, np.newaxis]).to(dev)
+        # if random.random() < self.style_mixing_prob:
+        #     mixing_cutoff = random.randint(1, 2*self.n_layer-1)
+        # else:
+        #     mixing_cutoff = 2*self.n_layer-1
+        #
+        # dlatents_in = torch.where(layer_idx < mixing_cutoff, w1, w2)
 
         for i, (block, to_rgb) in enumerate(zip(self.progress, self.to_rgb)):
             if i == 0:
@@ -295,6 +295,7 @@ class Generator(nn.Module):
                 out = block(out, dlatents_in[:, 2*i-1], dlatents_in[:, 2*i])
                 rgb_img = to_rgb(out, dlatents_in[:, 2*i])
                 rgb_img = rgb_img + upsampled_rgb_img
+
         return rgb_img, dlatents_in
 
 
@@ -319,7 +320,7 @@ class Discriminator(nn.Module):
                                                      3, 1, 3, 1, fused_downsample=False))
             skip_layers.append(EqualizedConv2d(channel_list[i], channel_list[i - 1], k_size=1,
                                                stride=2, padding=0))
-            blur_layers.append(Blur(channel_list[i-1]))
+            blur_layers.append(Blur(channel_list[i-1], weight=[1, 2, 1]))
 
         self.progress = nn.ModuleList(progress_layers)
         self.skip = nn.ModuleList(skip_layers)
@@ -348,20 +349,22 @@ class Discriminator(nn.Module):
 
 
 if __name__ == "__main__":
-    z = torch.rand(8, 512).to(dev)
-    const = torch.ones(4, 512, 4, 4).to(dev)
+    with torch.no_grad():
+        z = torch.rand(8, 512).to(dev)
+        const = torch.ones(4, 512, 4, 4).to(dev)
 
-    m = MappingNetwork(z_dim=512).to(dev)
-    g = Generator(channel_list=[512, 512, 512, 512, 256, 128, 64, 32]).to(dev)
-    d = Discriminator(channel_list=[512, 512, 512, 512, 256, 128, 64, 32]).to(dev)
-    alpha = 0.5
+        m = MappingNetwork(z_dim=512).to(dev)
+        g = Generator(channel_list=[512, 512, 512, 512, 256, 128, 64, 32]).to(dev)
+        d = Discriminator(channel_list=[512, 512, 512, 512, 256, 128, 64, 32]).to(dev)
+        alpha = 0.5
 
-    w = m(z)
-    w1, w2 = torch.split(w, 4, dim=0)
-    print("Generator")
-    out = g(const, w1, w2)
-    print(out.shape)
+        w = m(z)
+        w1, w2 = torch.split(w, 4, dim=0)
+        print("Generator")
+        out, latent = g(const, w1, w2)
+        print(out.shape)
+        print(latent.shape)
 
-    print("Discriminator")
-    out = d(out)
-    print(out.shape)
+        print("Discriminator")
+        out = d(out)
+        print(out.shape)

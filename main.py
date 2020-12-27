@@ -26,7 +26,7 @@ if __name__ == '__main__':
     parser.add_argument('--z_dim', type=int, default=512, help='dimension of random vector')
 
     # Config - Training
-    parser.add_argument('--batch_size', type=int, default=128, help='batch_size')
+    parser.add_argument('--batch_size', type=int, default=16, help='batch_size')
     parser.add_argument('--g_lr', type=float, default=0.001, help='gradient of generator')
     parser.add_argument('--d_lr', type=float, default=0.001, help='gradient of discriminator')
     parser.add_argument('--decay_iter', type=int, default=10000, help='learning rate decay iteration')
@@ -51,9 +51,9 @@ if __name__ == '__main__':
     parser.add_argument('--result_dir', type=str, default='result')
 
     # Config - Miscellanceous
-    parser.add_argument('--print_loss_iter', type=int, default=5000)
-    parser.add_argument('--save_image_iter', type=int, default=5000)
-    parser.add_argument('--save_parameter_iter', type=int, default=5000)
+    parser.add_argument('--print_loss_iter', type=int, default=1000)
+    parser.add_argument('--save_image_iter', type=int, default=1000)
+    parser.add_argument('--save_parameter_iter', type=int, default=1000)
     parser.add_argument('--save_log_iter', type=int, default=1000)
     config = parser.parse_args()
 
